@@ -25,7 +25,7 @@ def submit(input_path: str, job_name: Optional[str], completion_window: str) -> 
 
     client = get_client()
 
-    # Envia o Path direto para garantir que o filename preserve a extensão .jsonl
+    # Enviar o Path diretamente para preservar o nome do arquivo (.jsonl) no multipart
     file_resp = client.files.create(file=p, purpose="batch")
 
     metadata = {}
