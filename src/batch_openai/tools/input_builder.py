@@ -1,8 +1,10 @@
 import argparse
 import hashlib
 import json
+import re
+import os
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 
 TEMPLATE_FILES = {
     "diagram_activity": "03-diagram-activity.md",
@@ -20,13 +22,13 @@ TOPIC_INSTRUCTIONS = {
 }
 
 DEFAULT_MAX_TOKENS = {
-    "resumo": 800,
-    "fluxo_execucao": 600,
-    "regras_negocio": 600,
-    "diagram_activity": 700,
-    "diagram_sequence": 700,
+    "resumo": 80,
+    "fluxo_execucao": 60,
+    "regras_negocio": 60,
+    "diagram_activity": 70,
+    "diagram_sequence": 70,
     "riscos": 900,
-    "arch-context": 1200,
+    "arch-context": 120,
 }
 
 
@@ -63,22 +65,40 @@ def _build_message_content(topic: str, templates_dir: Path, variables: Dict[str,
     return _fill_template(tpl, variables)
 
 
-def _build_entry(custom_id: str, model: str, content: str, max_tokens: int) -> Dict[str, Any]:
+SYSTEM_PROMPT_DEFAULT = (
+    "Siga estritamente o formato do tópico. Idioma pt-BR. "
+    "Se faltar evidência no contexto fornecido, responda literalmente com 'Insuficiente'. "
+    "Não invente detalhes e não inclua texto fora do formato solicitado."
+)
+
+
+def _build_entry(custom_id: str, model: str, content: str, max_tokens: int, *, system_prompt: Optional[str] = None,
+                 temperature: float = 0.2, top_p: float = 0.9, seed: Optional[int] = None) -> Dict[str, Any]:
     return {
         "custom_id": custom_id,
         "method": "POST",
         "url": "/v1/chat/completions",
         "body": {
             "model": model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": ([{"role": "system", "content": system_prompt or SYSTEM_PROMPT_DEFAULT}] +
+                         [{"role": "user", "content": content}]),
             "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            **({"seed": seed} if seed is not None else {}),
         },
     }
 
 
+def _sha_seed(h8: str) -> int:
+    # derive a deterministic small int seed from an 8-hex hash
+    return int(h8, 16) % 2_147_483_547
+
+
 def build_inputs(config: Dict[str, Any], templates_dir: Path, out_path: Path) -> None:
     language = config.get("language", "pt-BR")
-    model = config.get("model", "gpt-4o-mini")
+    default_model = os.getenv("DEFAULT_MODEL", "gpt-5")
+    model = config.get("model", default_model)
     default_code_language = config.get("default_code_language", "unknown")
 
     lines: List[str] = []
@@ -87,7 +107,7 @@ def build_inputs(config: Dict[str, Any], templates_dir: Path, out_path: Path) ->
         code_language = p.get("code_language", default_code_language)
         title = p.get("title", proc)
         files = [Path(f) for f in p.get("files", [])]
-        topics = p.get("topics", ["resumo", "fluxo_execucao", "regras_negocio", "diagram_activity"])  # default básico
+        topics = p.get("topics", ["resumo", "fluxo_execucao", "regras_negocio", "diagram_activity", "diagram_sequence"])  # default 5 tópicos
 
         # concatenar conteúdo dos arquivos
         contents = []
@@ -114,25 +134,339 @@ def build_inputs(config: Dict[str, Any], templates_dir: Path, out_path: Path) ->
             cid = _build_custom_id(proc, topic, 0, h8, language, code_language)
             msg_content = _build_message_content(topic, templates_dir, vars)
             max_tokens = DEFAULT_MAX_TOKENS.get(topic, 800)
-            entry = _build_entry(cid, model, msg_content, max_tokens)
+            entry = _build_entry(cid, model, msg_content, max_tokens, seed=_sha_seed(h8))
             lines.append(json.dumps(entry, ensure_ascii=False))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# -------- Payload adapter (SADA-like) --------
+
+def _map_code_language(ep_language: str) -> str:
+    mapping = {
+        "dotnet": "csharp",
+        ".net": "csharp",
+        "c#": "csharp",
+        "vb6": "vb",
+        "vb": "vb",
+        "java": "java",
+        "python": "python",
+        "sql": "sql",
+    }
+    key = (ep_language or "").strip().lower()
+    return mapping.get(key, key or "unknown")
+
+
+def _first_n_lines(text: str, n: int) -> str:
+    return "\n".join(text.splitlines()[:n])
+
+
+def _extract_control_skeleton(text: str, max_lines: int = 200) -> str:
+    lines = []
+    for ln in text.splitlines():
+        if any(kw in ln for kw in ("if", "else", "for", "foreach", "while", "switch", "case", "return")):
+            lines.append(ln)
+        if len(lines) >= max_lines:
+            break
+    return "\n".join(lines[:max_lines])
+
+
+def _extract_rules(text: str, max_rules: int = 20) -> str:
+    # heurística simples: capturar linhas com if/validação/erro/modal
+    patt = re.compile(r"\b(if|validate|valida|erro|error|throw|return)\b", re.IGNORECASE)
+    rules = []
+    for ln in text.splitlines():
+        if patt.search(ln):
+            rules.append(f"- {ln.strip()}")
+        if len(rules) >= max_rules:
+            break
+    return "\n".join(rules)
+
+
+def _top_dep_names(deps: List[Dict[str, Any]], top_n: int = 10) -> List[str]:
+    scored: List[Tuple[int, str]] = []
+    for d in deps or []:
+        name = d.get("name") or ""
+        node_lines = int(d.get("node_lines") or d.get("total_subtree_lines") or 0)
+        scored.append((node_lines, name))
+    scored.sort(reverse=True)
+    return [n for _, n in scored[:top_n] if n]
+
+
+def build_inputs_from_payload(payload: Dict[str, Any], templates_dir: Path, out_path: Path, *, language: str = "pt-BR",
+                              topics: Optional[List[str]] = None, persist_context: Optional[Path] = None,
+                              max_tokens_override: Optional[Dict[str, int]] = None) -> None:
+    """Gera .jsonl a partir de um payload (formato SADA-like), criando context packs por tópico.
+
+    - persist_context: quando fornecido, salva os context packs em arquivos para auditoria.
+    """
+    model = payload.get("model") or os.getenv("DEFAULT_MODEL", "gpt-5")
+    ep_language = _map_code_language(payload.get("ep_language", ""))
+    entry = payload.get("entry_point") or {}
+    proc = entry.get("name") or "processo_desconhecido"
+    title = proc
+    content = entry.get("content") or ""
+    deps = entry.get("deps") or []
+
+    topics = topics or ["resumo", "fluxo_execucao", "regras_negocio", "diagram_activity", "diagram_sequence"]
+    top_dep_list = _top_dep_names(deps, top_n=10)
+    methods_txt = "\n".join(f"- {n}" for n in top_dep_list)
+    rules_txt = _extract_rules(content, max_rules=20)
+
+    # montar packs por tópico
+    packs: Dict[str, Dict[str, str]] = {}
+    packs["resumo"] = {
+        "content": _first_n_lines(content, 120) or content,
+        "methods": "\n".join(f"- {n}" for n in top_dep_list[:5]),
+        "rules": rules_txt,
+    }
+    packs["fluxo_execucao"] = {
+        "content": _extract_control_skeleton(content, 200) or _first_n_lines(content, 200),
+        "methods": methods_txt,
+        "rules": rules_txt,
+    }
+    packs["regras_negocio"] = {
+        "content": _first_n_lines(content, 200),
+        "methods": "",
+        "rules": rules_txt,
+    }
+    packs["diagram_activity"] = {
+        "content": _extract_control_skeleton(content, 150) or _first_n_lines(content, 150),
+        "methods": methods_txt,
+        "rules": rules_txt,
+    }
+    packs["diagram_sequence"] = {
+        "content": "",
+        "methods": methods_txt,
+        "rules": rules_txt,
+    }
+
+    # variáveis comuns
+    base_vars = {
+        "language": language,
+        "file_name": proc,
+        "code_language": ep_language,
+        "title": title,
+        "context_md": "",
+    }
+
+    lines: List[str] = []
+    for topic in topics:
+        pack = packs.get(topic, {"content": content, "methods": methods_txt, "rules": rules_txt})
+        vars = {**base_vars, **pack}
+        # custom hash por tópico baseado no conteúdo efetivo (concat chaves relevantes)
+        effective = f"{proc}\n{topic}\n{vars.get('content','')}\n{vars.get('methods','')}\n{vars.get('rules','')}"
+        h8 = _sha8(effective)
+
+        # opcionalmente persistir packs
+        if persist_context is not None:
+            topic_dir = persist_context / proc / topic
+            topic_dir.mkdir(parents=True, exist_ok=True)
+            (topic_dir / "content.md").write_text(vars.get("content", ""), encoding="utf-8")
+            (topic_dir / "methods.txt").write_text(vars.get("methods", ""), encoding="utf-8")
+            (topic_dir / "rules.txt").write_text(vars.get("rules", ""), encoding="utf-8")
+
+        # chunking simples por tamanho de conteúdo do pack (caracteres)
+        content_text = _build_message_content(topic, templates_dir, {
+            **vars,
+            "content": vars.get("content", ""),
+            "processes": vars.get("methods", ""),
+            "rules": vars.get("rules", ""),
+        })
+
+        # tamanho alvo aproximado
+        max_chars = 6000  # pequeno/seguro para testes; pode ser configurável
+        segments: List[str] = []
+        if len(content_text) <= max_chars:
+            segments = [content_text]
+        else:
+            # dividir em blocos respeitando quebras de linha
+            buf = []
+            acc = 0
+            for line in content_text.splitlines(True):
+                if acc + len(line) > max_chars and buf:
+                    segments.append("".join(buf))
+                    buf = []
+                    acc = 0
+                buf.append(line)
+                acc += len(line)
+            if buf:
+                segments.append("".join(buf))
+
+        max_tokens_map = max_tokens_override or DEFAULT_MAX_TOKENS
+        for i, seg_txt in enumerate(segments):
+            cid = _build_custom_id(proc, topic, i, h8, language, ep_language)
+            entry = _build_entry(
+                cid,
+                model,
+                seg_txt,
+                max_tokens_map.get(topic, 600),
+                seed=_sha_seed(h8),
+            )
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# -------- Normalizador/adaptador de payload SADA --------
+
+def _infer_language_from_filenames(files: List[str]) -> str:
+    for fp in files:
+        f = fp.lower()
+        if f.endswith(".cs"):  # C#
+            return "csharp"
+        if f.endswith(".vb") or f.endswith(".bas"):
+            return "vb"
+        if f.endswith(".java"):
+            return "java"
+        if f.endswith(".py"):
+            return "python"
+        if f.endswith(".sql"):
+            return "sql"
+    return "unknown"
+
+
+def normalize_payload_sada(payload_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Converte o payload SADA (ou variantes) para o formato canônico esperado por build_inputs_from_payload.
+
+    Formato canônico:
+      {
+        "model": str,
+        "ep_language": str,
+        "entry_point": {"name": str, "content": str, "deps": List[Dict]}
+      }
+    """
+    # Se já estiver canônico, apenas retorne
+    if isinstance(payload_raw.get("entry_point"), dict):
+        return payload_raw
+
+    pr = payload_raw
+
+    # Nome do processo / entry point
+    name_candidates = [
+        pr.get("entryPoint"), pr.get("entry_point"), pr.get("process"), pr.get("processo"),
+        pr.get("name"), pr.get("title"), pr.get("titulo"), pr.get("id")
+    ]
+    name = next((x for x in name_candidates if isinstance(x, str) and x.strip()), "processo_desconhecido")
+
+    # Código/conteúdo-fonte
+    content = None
+    # Campos diretos comuns
+    for key in ("source", "source_code", "code", "codigo", "conteudo", "body", "text"):
+        v = pr.get(key)
+        if isinstance(v, str) and v.strip():
+            content = v
+            break
+
+    # Listas de fontes/arquivos
+    files_collected: List[str] = []
+    if content is None:
+        # sources: [{path, content|code}]
+        sources = pr.get("sources")
+        if isinstance(sources, list):
+            parts = []
+            for it in sources:
+                if not isinstance(it, dict):
+                    continue
+                path = it.get("path") or it.get("file") or it.get("name") or ""
+                txt = it.get("content") or it.get("code") or ""
+                if isinstance(path, str) and isinstance(txt, str) and txt.strip():
+                    files_collected.append(path)
+                    header = f"\n\n// FILE: {path}\n"
+                    parts.append(header + txt)
+            if parts:
+                content = "\n".join(parts)
+
+    if content is None:
+        # files: [{path, content}] (ou lista de caminhos com outro campo de textos)
+        files = pr.get("files")
+        if isinstance(files, list):
+            parts = []
+            for it in files:
+                if isinstance(it, dict):
+                    path = it.get("path") or it.get("file") or it.get("name") or ""
+                    txt = it.get("content") or it.get("code") or ""
+                    if isinstance(path, str) and isinstance(txt, str) and txt.strip():
+                        files_collected.append(path)
+                        header = f"\n\n// FILE: {path}\n"
+                        parts.append(header + txt)
+                elif isinstance(it, str):
+                    files_collected.append(it)
+            if parts:
+                content = "\n".join(parts)
+
+    if content is None:
+        content = ""
+
+    # Dependências / deps
+    deps: List[Dict[str, Any]] = []
+    raw_deps = pr.get("deps") or pr.get("dependencies") or pr.get("dependencias") or pr.get("methods")
+    if isinstance(raw_deps, list):
+        for d in raw_deps:
+            if isinstance(d, dict):
+                name_d = d.get("name") or d.get("id") or d.get("method") or d.get("func")
+                node_lines = d.get("node_lines") or d.get("total_lines") or d.get("total_subtree_lines")
+                deps.append({"name": name_d, "node_lines": node_lines})
+            elif isinstance(d, str):
+                deps.append({"name": d, "node_lines": None})
+
+    # callgraph / graph nós (opcional)
+    cg = pr.get("callgraph") or pr.get("graph")
+    if isinstance(cg, dict):
+        nodes = cg.get("nodes") or []
+        if isinstance(nodes, list):
+            for n in nodes:
+                if isinstance(n, dict):
+                    nm = n.get("name") or n.get("id")
+                    nl = n.get("node_lines") or n.get("total_lines") or n.get("total_subtree_lines")
+                    deps.append({"name": nm, "node_lines": nl})
+
+    # Linguagem
+    lang_candidates = [
+        pr.get("ep_language"), pr.get("code_language"), pr.get("language"), pr.get("lang"),
+    ]
+    ep_language = next((x for x in lang_candidates if isinstance(x, str) and x.strip()), None)
+    if not ep_language and files_collected:
+        ep_language = _infer_language_from_filenames(files_collected)
+    ep_language = ep_language or "unknown"
+
+    model = pr.get("model") or "gpt-5"
+
+    return {
+        "model": model,
+        "ep_language": ep_language,
+        "entry_point": {
+            "name": name,
+            "content": content,
+            "deps": deps,
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gerador de inputs .jsonl para documentação modular em batch")
-    parser.add_argument("--config", required=True, help="Caminho do arquivo JSON de processos")
+    parser.add_argument("--config", help="Caminho do arquivo JSON de processos")
+    parser.add_argument("--payload", help="Caminho para payload JSON (ponto de entrada único)")
     parser.add_argument("--out", required=True, help="Caminho de saída do .jsonl gerado")
     parser.add_argument("--prompts", default="prompts", help="Diretório dos templates de prompts")
+    parser.add_argument("--persist-context", help="Diretório para salvar context packs (opcional)")
     args = parser.parse_args()
 
-    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
     templates_dir = Path(args.prompts)
     out_path = Path(args.out)
 
-    build_inputs(cfg, templates_dir, out_path)
+    if args.payload:
+        payload = json.loads(Path(args.payload).read_text(encoding="utf-8"))
+        persist_dir = Path(args.persist_context) if args.persist_context else None
+        build_inputs_from_payload(payload, templates_dir, out_path, persist_context=persist_dir)
+    elif args.config:
+        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        build_inputs(cfg, templates_dir, out_path)
+    else:
+        raise SystemExit("É necessário informar --payload ou --config")
+
     print(f"Arquivo gerado: {out_path}")
 
 

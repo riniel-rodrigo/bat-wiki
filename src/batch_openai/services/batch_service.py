@@ -11,7 +11,7 @@ from ..utils.files import ensure_output_dir, safe_copy_input
 TERMINAL_STATES = {"completed", "failed", "cancelled", "expired"}
 
 
-def submit(input_path: str, job_name: Optional[str], completion_window: str) -> str:
+def submit(input_path: str, job_name: Optional[str], completion_window: str, *, verbose: bool = True) -> str:
     p = Path(input_path)
     if not p.exists():
         print(f"ERROR: arquivo de entrada não encontrado: {input_path}", file=sys.stderr)
@@ -56,7 +56,8 @@ def submit(input_path: str, job_name: Optional[str], completion_window: str) -> 
 
     (out_dir / "batch.json").write_text(json.dumps(batch_data, indent=2, ensure_ascii=False))
     safe_copy_input(p, out_dir)
-    print(f"Batch criado. batch_id={batch_id}")
+    if verbose:
+        print(f"Batch criado. batch_id={batch_id}")
     return batch_id
 
 

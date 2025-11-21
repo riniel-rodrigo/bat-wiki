@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
-
 def as_http_error(e: Exception) -> HTTPException:
     msg = str(e)
     lowered = msg.lower()

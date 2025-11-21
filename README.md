@@ -1,4 +1,4 @@
-Estrutura
+'Estrutura
 ---------
 
 ```
@@ -61,7 +61,7 @@ echo OPENAI_API_KEY=sk-seu-token-aqui > .env
 ```
 
 2) Suba o servidor (PowerShell):
-
+uvicorn batch_openai.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 $env:PYTHONPATH="src"
 python -m uvicorn batch_openai.api:app --reload --host 0.0.0.0 --port 8000
@@ -123,6 +123,22 @@ Cada linha deve ser um objeto JSON com os campos esperados pelo Batch API. Exemp
 - `url`: "/v1/chat/completions"
 - `body`: payload compatível com o endpoint escolhido
 
+Novo fluxo: Payload → JSONL → Batch
+-----------------------------------
+Gere entradas a partir de um payload (ponto de entrada único) e rode o batch:
+
+```
+# 1) Gerar .jsonl a partir de um payload
+python -m batch_openai.tools.input_builder --payload C:\\Users\\Meta3\\Downloads\\payloadSADA.json \
+	--out inputs\\payload_sada.jsonl --prompts prompts --persist-context inputs\\compiled
+
+# 2) Submeter e orquestrar (submit→wait→download→parse)
+curl.exe -X POST "http://localhost:8000/batches/run" -H "Content-Type: application/json" \
+	-d '{"input_path":"inputs/payload_sada.jsonl","job_name":"sada-docs"}'
+```
+
+Saídas em `outputs/<batch_id>/docs/<proc>/<topic>/seg-XXX.(md|puml)` e `final.md` por processo.
+
 Contexto e idempotência via custom_id
 -------------------------------------
 
@@ -159,8 +175,26 @@ Troubleshooting
 - 404 ao parsear: verifique se `outputs/<batch_id>/output.jsonl` existe (faça `download`).
 - PowerShell: use `curl.exe` em vez do alias `curl` para `-H`/`-F`.
 
-Notas
------
+Limpeza e Artefatos Gerados
+---------------------------
+
+- Artefatos gerados (podem ser removidos a qualquer momento, serão recriados):
+	- `outputs/` (resultados por `batch_id`)
+	- `inputs/by_process/` (JSONL por processo e context packs por tópico quando `persist_context=true`)
+	- `inputs/payloads/` (JSONL gerados a partir de payloads)
+	- `inputs/compiled/` (layout antigo de context packs)
+	- `**/__pycache__/` (caches do Python)
+
+- Mantenha versionado (essencial):
+	- `src/**`, `prompts/**`, `requirements.txt`, `README.md`, `.env.example`, `.gitignore`
+
+- Script de limpeza rápida:
+	```bash
+	bash scripts/clean.sh
+	```
+
+Observações finais
+------------------
 
 - Os artefatos de cada batch são gravados em `outputs/<batch_id>/` (batch.json, input.jsonl, output.jsonl, errors.jsonl e pasta docs/ quando há parse).
 - A camada de serviços não executa parsing e nem lida com argparse; cada camada tem uma responsabilidade clara.

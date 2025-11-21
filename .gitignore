@@ -45,8 +45,14 @@ Thumbs.db
 logs/
 *.log
 
-# Project-specific
+# Project-specific (artifacts gerados)
 outputs/
-# Ignore all inputs except the published sample
-inputs/*.jsonl
-!inputs/sample_input.jsonl
+
+# Inputs gerados por execução (não versionar)
+inputs/payloads/
+inputs/by_process/
+inputs/compiled/
+
+# Se quiser manter apenas os exemplos publicados, descomente abaixo e ajuste conforme necessário
+# inputs/*.jsonl
+# !inputs/sample_input.jsonl

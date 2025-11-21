@@ -15,6 +15,15 @@ class RunRequest(SubmitRequest):
     do_parse: bool = True
 
 
+class RunPayloadRequest(BaseModel):
+    payload: Dict[str, Any]
+    job_name: Optional[str] = None
+    completion_window: str = "24h"
+    poll_interval: int = 10
+    do_parse: bool = True
+    persist_context: bool = False
+
+
 class WaitRequest(BaseModel):
     poll_interval: int = 10
 
