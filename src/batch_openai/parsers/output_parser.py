@@ -7,19 +7,9 @@ from pathlib import Path
 from collections import defaultdict
 
 
-def _safe_id(cid: str) -> str:
-    return (
-        cid.replace("/", "__")
-        .replace("\\", "__")
-        .replace(" ", "_")
-        .replace(":", "_")
-        .replace("|", "_")
-    )
-
-
 def _extract_meta_from_custom_id(custom_id: str) -> Dict[str, Any]:
     meta: Dict[str, Any] = {"custom_id": custom_id}
-    # Novo formato canônico: doc|v1|proc=...|topic=...|seg=...|hash=...|lang=...|code=...
+    # Formato canônico único: doc|v1|proc=...|topic=...|seg=...|hash=...|lang=...|code=...
     if custom_id.startswith("doc|v1|"):
         try:
             parts = custom_id.split("|")
@@ -41,29 +31,8 @@ def _extract_meta_from_custom_id(custom_id: str) -> Dict[str, Any]:
             meta["format"] = "unknown"
         return meta
 
-    # Legacy heuristics (mantém compatibilidade)
-    if "m3type_business" in custom_id:
-        meta["type"] = "business"
-    elif "m3type_tech_resume" in custom_id:
-        meta["type"] = "tech_resume"
-    else:
-        meta["type"] = "unknown"
-
-    try:
-        start = custom_id.index("m3id_") + len("m3id_")
-        end = custom_id.index("_m3type", start)
-        core = custom_id[start:end]
-        if "." in core:
-            cls, method = core.rsplit(".", 1)
-            meta["class_path"] = cls
-            meta["method"] = method
-        else:
-            meta["class_path"] = core
-            meta["method"] = None
-    except ValueError:
-        meta["class_path"] = None
-        meta["method"] = None
-
+    # Se não for v1, marcar como desconhecido (não processado)
+    meta["format"] = "unknown"
     return meta
 
 
@@ -115,8 +84,6 @@ def parse(batch_id: str, *, force: bool = False, only: Optional[Iterable[str]] =
                 choices[0]["message"]["content"] if choices and "message" in choices[0] else "(Sem conteúdo)"
             )
 
-            safe_id = _safe_id(cid)
-
             meta = _extract_meta_from_custom_id(cid)
 
             # Novo formato: salvar em docs/<proc>/<topic>/seg-XXX.(md|puml)
@@ -152,33 +119,12 @@ def parse(batch_id: str, *, force: bool = False, only: Optional[Iterable[str]] =
                 proc_topic_segments[proc][topic][seg] = target
                 continue
 
-            # Legacy: salvar como antes numa pasta flat
-            if "m3type_business" in cid:
-                fname = f"{safe_id}.business.md"
-            elif "m3type_tech_resume" in cid:
-                fname = f"{safe_id}.tech.md"
-            else:
-                fname = f"{safe_id}.md"
-
-            target = docs_dir / fname
-
-            if target.exists() and not force:
-                skipped += 1
-                items_index.append({
-                    "custom_id": cid,
-                    "file": str(target),
-                    "status": "skipped",
-                })
-                continue
-
-            # Não escrever front matter no Markdown final.
-            # Metadados continuam disponíveis em index.json (abaixo) e via nome do arquivo/custom_id.
-            target.write_text(content, encoding="utf-8")
-            processed += 1
+            # Formatos desconhecidos são ignorados (legacy removido)
+            skipped += 1
             items_index.append({
                 "custom_id": cid,
-                "file": str(target),
-                "status": "ok",
+                "file": None,
+                "status": "ignored",
             })
 
     # Compilar final.md por processo (novo formato)
@@ -194,7 +140,8 @@ def parse(batch_id: str, *, force: bool = False, only: Optional[Iterable[str]] =
             parts = []
             for p in ordered:
                 try:
-                    parts.append(Path(p).read_text(encoding="utf-8"))
+                    txt = Path(p).read_text(encoding="utf-8")
+                    parts.append(txt)
                 except Exception:
                     continue
             return "\n\n".join(parts) if parts else None

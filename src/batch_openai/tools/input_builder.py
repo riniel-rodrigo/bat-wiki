@@ -9,9 +9,6 @@ from typing import Dict, List, Any, Optional, Tuple
 TEMPLATE_FILES = {
     "diagram_activity": "03-diagram-activity.md",
     "diagram_sequence": "03-diagram-sequence.md",
-    "riscos": "04-risk-report.md",
-    "arch-context": "05-arch-context.json.md",
-    # Para resumo/fluxo_execucao/regras_negocio usaremos 02-doc-general.md com instruções adicionais
     "__general": "02-doc-general.md",
 }
 
@@ -21,14 +18,20 @@ TOPIC_INSTRUCTIONS = {
     "regras_negocio": "Gere SOMENTE a seção '## Regras de Negócio e Lógica Chave' como bullets claros.",
 }
 
+DEFAULT_TOPICS = [
+    "resumo",
+    "fluxo_execucao",
+    "regras_negocio",
+    "diagram_activity",
+    "diagram_sequence",
+]
+
 DEFAULT_MAX_TOKENS = {
     "resumo": 80,
     "fluxo_execucao": 60,
     "regras_negocio": 60,
     "diagram_activity": 70,
     "diagram_sequence": 70,
-    "riscos": 900,
-    "arch-context": 120,
 }
 
 
@@ -52,7 +55,7 @@ def _build_custom_id(proc: str, topic: str, seg: int, h8: str, language: str, co
 
 
 def _build_message_content(topic: str, templates_dir: Path, variables: Dict[str, str]) -> str:
-    if topic in ("diagram_activity", "diagram_sequence", "riscos", "arch-context"):
+    if topic in ("diagram_activity", "diagram_sequence"):
         tpl_file = templates_dir / TEMPLATE_FILES[topic]
         tpl = _read_text(tpl_file)
         return _fill_template(tpl, variables)
@@ -67,7 +70,7 @@ def _build_message_content(topic: str, templates_dir: Path, variables: Dict[str,
 
 SYSTEM_PROMPT_DEFAULT = (
     "Siga estritamente o formato do tópico. Idioma pt-BR. "
-    "Se faltar evidência no contexto fornecido, responda literalmente com 'Insuficiente'. "
+    "Quando identificar lacunas, descreva-as de forma clara em vez de usar placeholders fixos. "
     "Não invente detalhes e não inclua texto fora do formato solicitado."
 )
 
@@ -82,7 +85,9 @@ def _build_entry(custom_id: str, model: str, content: str, max_tokens: int, *, s
             "model": model,
             "messages": ([{"role": "system", "content": system_prompt or SYSTEM_PROMPT_DEFAULT}] +
                          [{"role": "user", "content": content}]),
-            "max_tokens": max_tokens,
+            # A API recente de batch para alguns modelos não aceita mais 'max_tokens';
+            # usar 'max_completion_tokens' conforme mensagem de erro retornada.
+            "max_completion_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
             **({"seed": seed} if seed is not None else {}),
@@ -95,50 +100,7 @@ def _sha_seed(h8: str) -> int:
     return int(h8, 16) % 2_147_483_547
 
 
-def build_inputs(config: Dict[str, Any], templates_dir: Path, out_path: Path) -> None:
-    language = config.get("language", "pt-BR")
-    default_model = os.getenv("DEFAULT_MODEL", "gpt-5")
-    model = config.get("model", default_model)
-    default_code_language = config.get("default_code_language", "unknown")
-
-    lines: List[str] = []
-    for p in config.get("processes", []):
-        proc = p["proc"]
-        code_language = p.get("code_language", default_code_language)
-        title = p.get("title", proc)
-        files = [Path(f) for f in p.get("files", [])]
-        topics = p.get("topics", ["resumo", "fluxo_execucao", "regras_negocio", "diagram_activity", "diagram_sequence"])  # default 5 tópicos
-
-        # concatenar conteúdo dos arquivos
-        contents = []
-        for fp in files:
-            if not fp.exists():
-                raise FileNotFoundError(f"Arquivo do processo '{proc}' não encontrado: {fp}")
-            contents.append(_read_text(fp))
-        content_str = "\n\n".join(contents)
-
-        # variáveis comuns
-        vars = {
-            "language": language,
-            "file_name": proc,
-            "code_language": code_language,
-            "content": content_str,
-            "title": title,
-            "processes": "",
-            "rules": "",
-            "context_md": "",
-        }
-        h8 = _sha8(proc + "\n" + content_str)
-
-        for topic in topics:
-            cid = _build_custom_id(proc, topic, 0, h8, language, code_language)
-            msg_content = _build_message_content(topic, templates_dir, vars)
-            max_tokens = DEFAULT_MAX_TOKENS.get(topic, 800)
-            entry = _build_entry(cid, model, msg_content, max_tokens, seed=_sha_seed(h8))
-            lines.append(json.dumps(entry, ensure_ascii=False))
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+ # build_inputs removido na refatoração (escopo multi-processos legacy)
 
 
 # -------- Payload adapter (SADA-like) --------
@@ -194,6 +156,72 @@ def _top_dep_names(deps: List[Dict[str, Any]], top_n: int = 10) -> List[str]:
     return [n for _, n in scored[:top_n] if n]
 
 
+def _aggregate_deps_content(deps: List[Dict[str, Any]], max_chars: int = 6000) -> str:
+    parts: List[str] = []
+    acc = 0
+    for d in deps:
+        nm = d.get("name") or "dep"
+        body = d.get("content") or ""
+        if not isinstance(body, str) or not body.strip():
+            continue
+        snippet = f"// DEP: {nm}\n" + body.strip() + "\n"
+        if acc + len(snippet) > max_chars:
+            break
+        parts.append(snippet)
+        acc += len(snippet)
+    return "\n".join(parts)
+
+
+def _extract_sequence_lines(text: str, max_lines: int = 180) -> str:
+    patt = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*\s*\(")
+    calls = []
+    for ln in text.splitlines():
+        if patt.search(ln):
+            calls.append(ln.strip())
+        if len(calls) >= max_lines:
+            break
+    return "\n".join(calls)
+
+
+def build_topic_packs(proc: str, content: str, deps: List[Dict[str, Any]], *,
+                      topics: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
+    topics = topics or list(DEFAULT_TOPICS)
+    top_dep_list = _top_dep_names(deps, top_n=10)
+    methods_txt = "\n".join(f"- {n}" for n in top_dep_list)
+    rules_txt = _extract_rules(content, max_rules=20)
+    deps_content_block = _aggregate_deps_content(deps)
+
+    packs: Dict[str, Dict[str, str]] = {
+        "resumo": {
+            "content": _first_n_lines(content, 120) or content,
+            "methods": "\n".join(f"- {n}" for n in top_dep_list[:5]),
+            "rules": rules_txt,
+        },
+        "fluxo_execucao": {
+            "content": _extract_control_skeleton(content, 200) or _first_n_lines(content, 200),
+            "methods": methods_txt,
+            "rules": rules_txt,
+        },
+        "regras_negocio": {
+            "content": _first_n_lines(content, 200),
+            "methods": "",
+            "rules": rules_txt,
+        },
+        "diagram_activity": {
+            "content": _extract_control_skeleton(content, 150) or _first_n_lines(content, 150),
+            "methods": methods_txt,
+            "rules": rules_txt,
+        },
+        "diagram_sequence": {
+            "content": _extract_sequence_lines(content, 180) or _extract_sequence_lines(deps_content_block, 180),
+            "methods": methods_txt,
+            "rules": rules_txt,
+        },
+    }
+
+    return {k: v for k, v in packs.items() if k in topics}
+
+
 def build_inputs_from_payload(payload: Dict[str, Any], templates_dir: Path, out_path: Path, *, language: str = "pt-BR",
                               topics: Optional[List[str]] = None, persist_context: Optional[Path] = None,
                               max_tokens_override: Optional[Dict[str, int]] = None) -> None:
@@ -205,55 +233,24 @@ def build_inputs_from_payload(payload: Dict[str, Any], templates_dir: Path, out_
     ep_language = _map_code_language(payload.get("ep_language", ""))
     entry = payload.get("entry_point") or {}
     proc = entry.get("name") or "processo_desconhecido"
-    title = proc
     content = entry.get("content") or ""
     deps = entry.get("deps") or []
 
-    topics = topics or ["resumo", "fluxo_execucao", "regras_negocio", "diagram_activity", "diagram_sequence"]
-    top_dep_list = _top_dep_names(deps, top_n=10)
-    methods_txt = "\n".join(f"- {n}" for n in top_dep_list)
-    rules_txt = _extract_rules(content, max_rules=20)
-
-    # montar packs por tópico
-    packs: Dict[str, Dict[str, str]] = {}
-    packs["resumo"] = {
-        "content": _first_n_lines(content, 120) or content,
-        "methods": "\n".join(f"- {n}" for n in top_dep_list[:5]),
-        "rules": rules_txt,
-    }
-    packs["fluxo_execucao"] = {
-        "content": _extract_control_skeleton(content, 200) or _first_n_lines(content, 200),
-        "methods": methods_txt,
-        "rules": rules_txt,
-    }
-    packs["regras_negocio"] = {
-        "content": _first_n_lines(content, 200),
-        "methods": "",
-        "rules": rules_txt,
-    }
-    packs["diagram_activity"] = {
-        "content": _extract_control_skeleton(content, 150) or _first_n_lines(content, 150),
-        "methods": methods_txt,
-        "rules": rules_txt,
-    }
-    packs["diagram_sequence"] = {
-        "content": "",
-        "methods": methods_txt,
-        "rules": rules_txt,
-    }
+    topics = topics or list(DEFAULT_TOPICS)
+    packs = build_topic_packs(proc, content, deps, topics=topics)
 
     # variáveis comuns
     base_vars = {
         "language": language,
         "file_name": proc,
         "code_language": ep_language,
-        "title": title,
+        "title": proc,
         "context_md": "",
     }
 
     lines: List[str] = []
     for topic in topics:
-        pack = packs.get(topic, {"content": content, "methods": methods_txt, "rules": rules_txt})
+        pack = packs.get(topic, {"content": content, "methods": "", "rules": ""})
         vars = {**base_vars, **pack}
         # custom hash por tópico baseado no conteúdo efetivo (concat chaves relevantes)
         effective = f"{proc}\n{topic}\n{vars.get('content','')}\n{vars.get('methods','')}\n{vars.get('rules','')}"
@@ -447,7 +444,7 @@ def normalize_payload_sada(payload_raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser(description="Gerador de inputs .jsonl para documentação modular em batch")
-    parser.add_argument("--config", help="Caminho do arquivo JSON de processos")
+    # Removido suporte a --config (multi-processos)
     parser.add_argument("--payload", help="Caminho para payload JSON (ponto de entrada único)")
     parser.add_argument("--out", required=True, help="Caminho de saída do .jsonl gerado")
     parser.add_argument("--prompts", default="prompts", help="Diretório dos templates de prompts")
@@ -457,15 +454,11 @@ def main():
     templates_dir = Path(args.prompts)
     out_path = Path(args.out)
 
-    if args.payload:
-        payload = json.loads(Path(args.payload).read_text(encoding="utf-8"))
-        persist_dir = Path(args.persist_context) if args.persist_context else None
-        build_inputs_from_payload(payload, templates_dir, out_path, persist_context=persist_dir)
-    elif args.config:
-        cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        build_inputs(cfg, templates_dir, out_path)
-    else:
-        raise SystemExit("É necessário informar --payload ou --config")
+    if not args.payload:
+        raise SystemExit("É necessário informar --payload")
+    payload = json.loads(Path(args.payload).read_text(encoding="utf-8"))
+    persist_dir = Path(args.persist_context) if args.persist_context else None
+    build_inputs_from_payload(payload, templates_dir, out_path, persist_context=persist_dir)
 
     print(f"Arquivo gerado: {out_path}")
 

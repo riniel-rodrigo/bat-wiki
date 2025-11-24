@@ -49,9 +49,7 @@ logs/
 outputs/
 
 # Inputs gerados por execução (não versionar)
-inputs/payloads/
 inputs/by_process/
-inputs/compiled/
 
 # Se quiser manter apenas os exemplos publicados, descomente abaixo e ajuste conforme necessário
 # inputs/*.jsonl

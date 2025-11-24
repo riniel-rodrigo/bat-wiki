@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from pydantic import BaseModel
 
 
@@ -10,27 +10,8 @@ class SubmitRequest(BaseModel):
     completion_window: str = "24h"
 
 
-class RunRequest(SubmitRequest):
-    poll_interval: int = 10
-    do_parse: bool = True
-
-
-class RunPayloadRequest(BaseModel):
-    payload: Dict[str, Any]
-    job_name: Optional[str] = None
-    completion_window: str = "24h"
-    poll_interval: int = 10
-    do_parse: bool = True
-    persist_context: bool = False
-
-
 class WaitRequest(BaseModel):
     poll_interval: int = 10
-
-
-class ParseRequest(BaseModel):
-    force: bool = False
-    only: Optional[List[str]] = None
 
 
 class BatchStatusResponse(BaseModel):
@@ -49,14 +30,10 @@ class DownloadResponse(BaseModel):
     error_file: Optional[str] = None
 
 
-class ParseResponse(BaseModel):
-    docs_dir: Optional[str] = None
-    processed: int = 0
-    skipped: int = 0
-    index_file: Optional[str] = None
-
-
-class RunResponse(BaseModel):
+class RunPayloadFileResponse(BaseModel):
     batch_id: str
     download: DownloadResponse
-    parse: Optional[ParseResponse] = None
+    parse_docs_dir: Optional[str] = None
+    parse_processed: int = 0
+    parse_skipped: int = 0
+    parse_index_file: Optional[str] = None

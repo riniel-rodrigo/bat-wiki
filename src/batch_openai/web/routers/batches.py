@@ -5,28 +5,23 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 
 from ...services.openai_client import get_client
-from ...services.batch_service import submit as svc_submit
+from ...services.batch_service import submit as svc_submit, TERMINAL_STATES
 from ...utils.files import ensure_output_dir
+from ...utils.payloads import decode_payload_bytes
 from ...parsers.output_parser import parse as parse_outputs
 from ..errors import as_http_error
 from ..schemas.batches import (
     SubmitRequest,
-    RunRequest,
-    RunPayloadRequest,
     WaitRequest,
-    ParseRequest,
     SubmitResponse,
     BatchStatusResponse,
     DownloadResponse,
-    ParseResponse,
-    RunResponse,
+    RunPayloadFileResponse,
 )
 from ...tools.input_builder import build_inputs_from_payload, normalize_payload_sada
 
 
 router = APIRouter(tags=["Batches"])
-
-TERMINAL_STATES = {"completed", "failed", "cancelled", "expired"}
 
 # Flag opcional via env para habilitar/desabilitar logs de status (default: ON)
 import os
@@ -96,18 +91,18 @@ def _download_files(batch_id: str) -> DownloadResponse:
     return DownloadResponse(**resp)
 
 
-def _parse_outputs(batch_id: str, force: bool = False, only: Optional[list[str]] = None) -> ParseResponse:
+def _parse_outputs(batch_id: str, force: bool = False, only: Optional[list[str]] = None) -> Dict[str, Any]:
     out_dir = ensure_output_dir(batch_id)
     output_path = out_dir / "output.jsonl"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail=f"{output_path} not found; download first")
     result = parse_outputs(batch_id, force=force, only=only)
-    return ParseResponse(
-        docs_dir=result.get("docs_dir"),
-        processed=result.get("processed", 0),
-        skipped=result.get("skipped", 0),
-        index_file=str(out_dir / "index.json"),
-    )
+    return {
+        "docs_dir": result.get("docs_dir"),
+        "processed": result.get("processed", 0),
+        "skipped": result.get("skipped", 0),
+        "index_file": str(out_dir / "index.json"),
+    }
 
 
 @router.post(
@@ -181,142 +176,7 @@ def download(batch_id: str) -> DownloadResponse:
         raise as_http_error(e)
 
 
-@router.post(
-    "/batches/{batch_id}/parse",
-    summary="Gerar documentos a partir do output",
-    description=(
-        "Lê outputs/<batch_id>/output.jsonl e gera arquivos .md em outputs/<batch_id>/docs/. "
-        "Use após o download. Parâmetros: 'force' (reescrever arquivos existentes) e 'only' (lista de custom_id)."
-    ),
-    response_model=ParseResponse,
-)
-def parse(batch_id: str, req: Optional[ParseRequest] = None) -> ParseResponse:
-    try:
-        force = req.force if req else False
-        only = req.only if req else None
-        return _parse_outputs(batch_id, force=force, only=only)
-    except HTTPException:
-        raise
-    except SystemExit as e:
-        raise HTTPException(status_code=400, detail=f"parse failed with code {e.code}")
-    except Exception as e:
-        raise as_http_error(e)
-
-
-@router.post(
-    "/batches/run",
-    summary="Fluxo completo: submit → wait → download → (parse)",
-    description=(
-        "Executa o processo completo em uma única chamada. Campos: input_path, job_name, "
-        "completion_window, poll_interval e do_parse. Retorna batch_id e caminhos gerados."
-    ),
-    response_model=RunResponse,
-)
-def run(req: RunRequest) -> RunResponse:
-    try:
-        batch_id = svc_submit(req.input_path, req.job_name, req.completion_window, verbose=True)
-        _ = _wait_blocking(batch_id, req.poll_interval)
-        d = _download_files(batch_id)
-        parsed = None
-        if req.do_parse:
-            parsed = _parse_outputs(batch_id, force=False, only=None)
-        return RunResponse(batch_id=batch_id, download=d, parse=parsed)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise as_http_error(e)
-
-
-@router.post(
-    "/batches/run-file",
-    summary="Upload + fluxo completo",
-    description=(
-        "Faz upload de um .jsonl e executa o fluxo completo: submit → wait → download → (parse). "
-        "Campos multipart: file (.jsonl), job_name, completion_window, poll_interval, do_parse."
-    ),
-    response_model=RunResponse,
-)
-async def run_file(
-    file: UploadFile = File(...),
-    job_name: Optional[str] = Form(default=None),
-    completion_window: str = Form(default="24h"),
-    poll_interval: int = Form(default=10),
-    do_parse: bool = Form(default=True),
-) -> RunResponse:
-    try:
-        filename = file.filename or "uploaded.jsonl"
-        if not filename.lower().endswith(".jsonl"):
-            raise HTTPException(status_code=400, detail="arquivo deve ter extensão .jsonl")
-
-        from pathlib import Path
-        import uuid
-
-        inputs_dir = Path("inputs")
-        inputs_dir.mkdir(parents=True, exist_ok=True)
-        dest_path = inputs_dir / f"{uuid.uuid4().hex}__{filename}"
-
-        total = 0
-        with dest_path.open("wb") as out:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                out.write(chunk)
-        if total == 0:
-            raise HTTPException(status_code=400, detail="arquivo vazio")
-
-        batch_id = svc_submit(str(dest_path), job_name, completion_window, verbose=True)
-        _ = _wait_blocking(batch_id, poll_interval=poll_interval)
-        d = _download_files(batch_id)
-        parsed = None
-        if do_parse:
-            parsed = _parse_outputs(batch_id, force=False, only=None)
-        return RunResponse(batch_id=batch_id, download=d, parse=parsed)
-    except HTTPException:
-        raise
-    except SystemExit as e:
-        raise HTTPException(status_code=400, detail=f"run-file failed with code {e.code}")
-    except Exception as e:
-        raise as_http_error(e)
-
-
-@router.post(
-    "/batches/run-payload",
-    summary="Payload JSON → (build .jsonl) → submit → wait → download → (parse)",
-    description=(
-        "Recebe o payload JSON do processo, gera um .jsonl modular (5 tópicos), "
-        "e executa todo o fluxo. Opcional: persistir context packs para auditoria."
-    ),
-    response_model=RunResponse,
-)
-def run_payload(req: RunPayloadRequest) -> RunResponse:
-    try:
-        from pathlib import Path
-        payload_norm = normalize_payload_sada(req.payload or {})
-        proc = (payload_norm.get("entry_point") or {}).get("name") or "processo"
-        sanitized = proc.replace(" ", "").replace("/", "_")
-        proc_root = Path("inputs/by_process") / sanitized
-        jsonl_dir = proc_root / "payloads"
-        jsonl_dir.mkdir(parents=True, exist_ok=True)
-        jsonl_path = jsonl_dir / f"{sanitized}.jsonl"
-        # para agrupar por processo, passamos a raiz dos processos; o builder criará <proc>/<topic>/...
-        ctx_dir = Path("inputs/by_process") if req.persist_context else None
-        templates_dir = Path("prompts")
-        build_inputs_from_payload(payload_norm, templates_dir, jsonl_path, persist_context=ctx_dir)
-
-        run_req = RunRequest(
-            input_path=str(jsonl_path),
-            job_name=req.job_name,
-            completion_window=req.completion_window,
-            poll_interval=req.poll_interval,
-            do_parse=req.do_parse,
-        )
-        return run(run_req)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise as_http_error(e)
+# Removidos endpoints antigos: parse, run, run-file, run-payload (refatoração de escopo solicitado)
 
 
 @router.post(
@@ -326,7 +186,7 @@ def run_payload(req: RunPayloadRequest) -> RunResponse:
         "Recebe um arquivo JSON (payload do processo) via multipart/form-data, gera um .jsonl modular (5 tópicos), "
         "e executa todo o fluxo. Campos: file (obrigatório), job_name, completion_window, poll_interval, do_parse, persist_context."
     ),
-    response_model=RunResponse,
+    response_model=RunPayloadFileResponse,
 )
 async def run_payload_file(
     file: UploadFile = File(...),
@@ -335,142 +195,16 @@ async def run_payload_file(
     poll_interval: int = Form(default=10),
     do_parse: bool = Form(default=True),
     persist_context: bool = Form(default=False),
-) -> RunResponse:
+) -> RunPayloadFileResponse:
     try:
         if not (file.filename or "").lower().endswith((".json", ".payload", ".txt")):
             # Aceita também .txt para facilitar, mas valida conteúdo abaixo
             pass
         raw = await file.read()
-        if not raw:
-            raise HTTPException(status_code=400, detail="arquivo vazio")
-        # tentativa de detecção de encoding comum (utf-8/utf-8-sig/utf-16)
-        text = None
-        for enc in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1", "cp1252"):
-            try:
-                text = raw.decode(enc)
-                break
-            except Exception:
-                continue
-        if text is None:
-            # tentar chardet
-            try:
-                import chardet  # type: ignore
-                det = chardet.detect(raw)
-                enc = (det or {}).get("encoding") or "utf-8"
-                text = raw.decode(enc, errors="replace")
-            except Exception:
-                # último recurso
-                text = raw.decode("utf-8", errors="replace")
-        import json as _json
-        def _try_parse(s: str):
-            try:
-                return _json.loads(s)
-            except Exception:
-                return None
-        # normalizar caracteres de aspas "inteligentes" e remover controles
-        def _normalize_chars(s: str) -> str:
-            s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u201e", '"').replace("\u201f", '"')
-            s = s.replace("\u2018", "'").replace("\u2019", "'")
-            # remover controles exceto \t, \n, \r
-            s = "".join(ch for ch in s if ch >= " " or ch in "\t\n\r")
-            return s
-        text = _normalize_chars(text)
-        payload = _try_parse(text)
-        if payload is None:
-            # tentar com BOM removido
-            if text.startswith("\ufeff"):
-                payload = _try_parse(text.lstrip("\ufeff"))
-        if payload is None:
-            # tentar json5 se instalado
-            try:
-                import json5  # type: ignore
-                payload = json5.loads(text)
-            except Exception:
-                payload = None
-        if payload is None:
-            # sanitização leve: remove comentários /* */ e //, linhas iniciadas com #, e vírgulas finais antes de }]
-            import re as _re
-            s = _re.sub(r"/\*.*?\*/", "", text, flags=_re.S)
-            s = _re.sub(r"(^|\s)//.*$", "", s, flags=_re.M)
-            s = _re.sub(r"^\s*#.*$", "", s, flags=_re.M)
-            s = _re.sub(r",\s*([}\]])", r"\1", s)
-            # remover asteriscos fora de strings (padrões vistos em amostras)
-            def _drop_unquoted(st: str, drop_chars: str = "*") -> str:
-                res = []
-                in_str = False
-                esc = False
-                for ch in st:
-                    if in_str:
-                        if esc:
-                            res.append(ch)
-                            esc = False
-                        else:
-                            if ch == "\\":
-                                res.append(ch)
-                                esc = True
-                            elif ch == '"':
-                                res.append(ch)
-                                in_str = False
-                            else:
-                                res.append(ch)
-                    else:
-                        if ch == '"':
-                            res.append(ch)
-                            in_str = True
-                        else:
-                            if ch in drop_chars:
-                                continue
-                            res.append(ch)
-                return "".join(res)
-            s = _drop_unquoted(s)
-            payload = _try_parse(s)
-            if payload is None:
-                # tentar extrair primeiro objeto/array balanceado
-                def _extract_first_json_block(txt: str) -> list[str]:
-                    blocks: list[str] = []
-                    for opener, closer in (("{", "}"), ("[", "]")):
-                        i = txt.find(opener)
-                        while i != -1:
-                            depth = 0
-                            in_str = False
-                            esc = False
-                            for j in range(i, len(txt)):
-                                ch = txt[j]
-                                if in_str:
-                                    if esc:
-                                        esc = False
-                                    else:
-                                        if ch == "\\":
-                                            esc = True
-                                        elif ch == '"':
-                                            in_str = False
-                                else:
-                                    if ch == '"':
-                                        in_str = True
-                                    elif ch == opener:
-                                        depth += 1
-                                    elif ch == closer:
-                                        depth -= 1
-                                        if depth == 0:
-                                            blocks.append(txt[i:j+1])
-                                            break
-                            i = txt.find(opener, i + 1)
-                    return blocks
-                candidates = _extract_first_json_block(s)
-                # tentar json5 e json padrão em cada bloco
-                for cand in candidates:
-                    try:
-                        import json5  # type: ignore
-                        payload = json5.loads(cand)
-                        break
-                    except Exception:
-                        pass
-                    obj = _try_parse(cand)
-                    if obj is not None:
-                        payload = obj
-                        break
-        if payload is None:
-            raise HTTPException(status_code=400, detail="conteúdo inválido: não é JSON")
+        try:
+            payload = decode_payload_bytes(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
         from pathlib import Path
         payload_norm = normalize_payload_sada(payload or {})
@@ -485,14 +219,25 @@ async def run_payload_file(
         templates_dir = Path("prompts")
         build_inputs_from_payload(payload_norm, templates_dir, jsonl_path, persist_context=ctx_dir)
 
-        run_req = RunRequest(
-            input_path=str(jsonl_path),
-            job_name=job_name,
-            completion_window=completion_window,
-            poll_interval=poll_interval,
-            do_parse=do_parse,
+        # Submit
+        batch_id = svc_submit(str(jsonl_path), job_name, completion_window, verbose=True)
+        # Wait
+        _ = _wait_blocking(batch_id, poll_interval=poll_interval)
+        # Download
+        d = _download_files(batch_id)
+        # Parse (sempre porque faz parte do fluxo solicitado implícito)
+        parse_result = None
+        if do_parse:
+            pr = _parse_outputs(batch_id, force=False, only=None)
+            parse_result = pr
+        return RunPayloadFileResponse(
+            batch_id=batch_id,
+            download=d,
+            parse_docs_dir=(parse_result.get("docs_dir") if parse_result else None),
+            parse_processed=(parse_result.get("processed") if parse_result else 0),
+            parse_skipped=(parse_result.get("skipped") if parse_result else 0),
+            parse_index_file=(str(ensure_output_dir(batch_id) / "index.json") if parse_result else None),
         )
-        return run(run_req)
     except HTTPException:
         raise
     except Exception as e:

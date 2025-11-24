@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Limpa artefatos gerados pelo pipeline
-rm -rf "inputs/by_process" "inputs/payloads" "inputs/compiled"
+rm -rf "inputs/by_process"
 rm -rf "outputs"
 
 # Limpa caches do Python

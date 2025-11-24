@@ -1,23 +1,28 @@
-'Estrutura
----------
+'Estrutura Enxuta
+-----------------
 
 ```
 src/batch_openai/
-	api.py                  # app FastAPI (faz include dos routers)
+	api.py                # App FastAPI
 	web/
 		routers/
-			batches.py          # rotas HTTP (batches)
+			batches.py        # Endpoints de batch
+			preview.py        # Endpoint único de preview completo
 		schemas/
-			batches.py          # modelos Pydantic (requests/responses)
-		errors.py             # mapeamento central de exceções → HTTP
-	config.py               # carregamento do .env e helpers de env
+			batches.py        # Schemas ativos (submit, status, wait, download, run-payload-file)
+			preview.py        # PreviewItem / PreviewFullResponse
+		errors.py           # Mapeamento exceções → HTTP
 	services/
-		openai_client.py      # criação do cliente OpenAI
-		batch_service.py      # submit, wait, download (camada de serviço)
+		openai_client.py    # Cliente OpenAI
+		batch_service.py    # Lógica submit/wait/download
+		preview_service.py  # Execução direta para preview
 	parsers/
-		output_parser.py      # parse do output.jsonl → arquivos .md
+		output_parser.py    # Parser v1 (doc|v1|...)
+	tools/
+		input_builder.py    # Builder a partir de payload SADA (somente modo --payload)
 	utils/
-		files.py              # utilidades de filesystem
+		files.py            # Helpers de filesystem
+	prompts/              # Templates de tópicos (resumo, fluxo_execucao, regras_negocio, diagram_activity, diagram_sequence)
 ```
 
 Requisitos
@@ -81,29 +86,17 @@ Invoke-RestMethod -Uri "http://localhost:8000/batches/run" -Method Post -Content
 
 Nota PowerShell: use `curl.exe` (não o alias `curl`) para enviar `-H`/`-F` sem erro.
 
-Sumário de Endpoints (Swagger)
-------------------------------
+Endpoints Ativos
+----------------
 
-- `POST /batches` — Criar batch (submit):
-	- Corpo: `input_path`, `job_name` (opcional), `completion_window` (ex. `24h`).
-	- Retorna: `batch_id`, `output_dir`.
+- `POST /batches` — Criar batch (submit)
+- `GET /batches/{batch_id}/status` — Consultar status
+- `POST /batches/{batch_id}/wait` — Aguardar conclusão
+- `POST /batches/{batch_id}/download` — Baixar `output.jsonl` / `errors.jsonl`
+- `POST /batches/run-payload-file` — Upload de payload JSON → gerar .jsonl → submit → wait → download → parse
+- `POST /preview/payload-file/full` — Preview completo (sem fila Batch) via upload de payload JSON (gera output.jsonl sintético + parse)
 
-- `GET /batches/{batch_id}/status` — Consultar status atual.
-
-- `POST /batches/{batch_id}/wait` — Aguardar conclusão:
-	- Corpo: `poll_interval` (opcional). Persiste `outputs/<batch_id>/batch.json`.
-
-- `POST /batches/{batch_id}/download` — Baixar resultados:
-	- Pré-condição: batch em `completed` (senão 409). Salva `output.jsonl` e `errors.jsonl` (quando houver).
-
-- `POST /batches/{batch_id}/parse` — Gerar documentos a partir do output:
-	- Corpo (opcional): `{ "force": false, "only": ["<custom_id>", ...] }`.
-	- Retorna: `docs_dir`, `processed`, `skipped`, `index_file`.
-
-- `POST /batches/run` — Fluxo completo com `input_path`.
-
-- `POST /batches/run-file` — Upload + fluxo completo:
-	- Multipart: `file` (.jsonl), `job_name`, `completion_window`, `poll_interval`, `do_parse`.
+Todos os endpoints acima estão documentados em `/docs` (Swagger UI).
 
 Observações
 -----------
@@ -112,50 +105,51 @@ Observações
 
 Formato do JSONL (input)
 ------------------------
-Cada linha deve ser um objeto JSON com os campos esperados pelo Batch API. Exemplo mínimo para chat completions:
+Cada linha segue o formato:
 
 ```json
-{"custom_id":"MinhaClasse.meuMetodo.m3type_business","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4o-mini","messages":[{"role":"system","content":"Você é um assistente útil."},{"role":"user","content":"Explique X."}]}}
+{
+	"custom_id": "doc|v1|proc=<proc>|topic=<topic>|seg=<n>|hash=<h8>|lang=pt-BR|code=<lang>",
+	"method": "POST",
+	"url": "/v1/chat/completions",
+	"body": {
+		"model": "gpt-5",
+		"messages": [ {"role":"system","content":"..."}, {"role":"user","content":"..."} ],
+		"max_completion_tokens": 120
+	}
+}
 ```
 
-- `custom_id`: identificador único por item (usado no parser e idempotência)
-- `method`: "POST"
-- `url`: "/v1/chat/completions"
-- `body`: payload compatível com o endpoint escolhido
+Observação: Batch API recente exige `max_completion_tokens` (não `max_tokens`).
 
-Novo fluxo: Payload → JSONL → Batch
------------------------------------
-Gere entradas a partir de um payload (ponto de entrada único) e rode o batch:
+Fluxo Payload → Batch
+---------------------
+Use `POST /batches/run-payload-file` com um payload JSON (formato SADA) para gerar o `.jsonl`, submeter, aguardar e parsear automaticamente.
+
+Artefatos finais: `outputs/<batch_id>/output.jsonl`, `docs/<proc>/<topic>/seg-XXX.(md|puml)` e `final.md` por processo.
+
+Preview Completo (único endpoint)
+---------------------------------
+Para validar saída e parse sem fila Batch, use:
 
 ```
-# 1) Gerar .jsonl a partir de um payload
-python -m batch_openai.tools.input_builder --payload C:\\Users\\Meta3\\Downloads\\payloadSADA.json \
-	--out inputs\\payload_sada.jsonl --prompts prompts --persist-context inputs\\compiled
-
-# 2) Submeter e orquestrar (submit→wait→download→parse)
-curl.exe -X POST "http://localhost:8000/batches/run" -H "Content-Type: application/json" \
-	-d '{"input_path":"inputs/payload_sada.jsonl","job_name":"sada-docs"}'
+curl -X POST http://localhost:8000/preview/payload-file/full \
+  -H "Accept: application/json" \
+  -F "file=@payloadSADA.json" \
+  -F "do_parse=true"
 ```
 
-Saídas em `outputs/<batch_id>/docs/<proc>/<topic>/seg-XXX.(md|puml)` e `final.md` por processo.
+Parâmetros opcionais:
+- `max_tokens_override=NN` ou JSON por tópico.
+- `topics=...` lista separada por vírgulas (default: cinco tópicos padrão).
 
-Contexto e idempotência via custom_id
--------------------------------------
-
-- Cada item no JSONL possui `custom_id`, que carrega contexto (classe/método e tipo como `m3type_*`).
-- Benefícios:
-	- Idempotência: evita duplicar saídas; o parser pode pular arquivos existentes (`force=false`).
-	- Reprocessamento seletivo: processe apenas alguns `custom_id` (`only=[...]`).
-	- Tracking: correlação input → output → arquivo `.md` no `docs/` através do `custom_id`.
-	- Agrupamento: geração por tipo (ex.: `business`, `tech_resume`).
-
-Parser e index
---------------
-
-- Arquivos `.md` gerados em `outputs/<batch_id>/docs/` usam o `custom_id` sanetizado no nome e preservam o tipo (`.business.md`, `.tech.md`, ou `.md`).
-- Cada arquivo contém front-matter com: `custom_id`, `batch_id`, `type`, `class_path`, `method`.
-- É gerado `outputs/<batch_id>/index.json` com um resumo:
-	- `batch_id`, `docs_dir`, `processed`, `skipped`, e `items` (lista de `{custom_id, file, status}`).
+Custom ID v1
+------------
+Formato: `doc|v1|proc=<proc>|topic=<topic>|seg=<n>|hash=<h8>|lang=<lang>|code=<code_language>`.
+Usado para:
+- Nome de arquivo por tópico/segmento.
+- Merge automático em `final.md`.
+- Correlação input/output.
 
 Exemplo extra
 -------------
@@ -163,13 +157,14 @@ Se preferir não fazer upload em toda chamada, reutilize o mesmo `.jsonl` local 
 
 Notas da API
 ------------
-- Saídas são gravadas em `outputs/<batch_id>/`.
-- Endpoints retornam erros HTTP amigáveis quando o serviço interno sinaliza falhas.
+- Saídas gravadas em `outputs/<batch_id>/`.
 - `download` retorna 409 se o batch ainda não estiver `completed`.
+- Modelos estritos (ex.: `gpt-5`, `openai_o4-mini`) não aceitam `temperature/top_p/seed`; sanitização automática aplicada.
 
 Troubleshooting
 ---------------
 - 400 "Invalid file format for Batch API. Must be .jsonl": o arquivo deve ter extensão `.jsonl` e conter uma linha JSON válida por linha (sem vírgulas extras, sem arrays). O upload já preserva `.jsonl`.
+- 400 "Unsupported parameter: 'max_tokens' ...": atualize suas linhas para usar `max_completion_tokens` em vez de `max_tokens`.
 - 401/403: verifique `OPENAI_API_KEY` no `.env`.
 - 409 no download: chame `wait` primeiro (ou use `run`/`run-file`).
 - 404 ao parsear: verifique se `outputs/<batch_id>/output.jsonl` existe (faça `download`).
@@ -181,8 +176,6 @@ Limpeza e Artefatos Gerados
 - Artefatos gerados (podem ser removidos a qualquer momento, serão recriados):
 	- `outputs/` (resultados por `batch_id`)
 	- `inputs/by_process/` (JSONL por processo e context packs por tópico quando `persist_context=true`)
-	- `inputs/payloads/` (JSONL gerados a partir de payloads)
-	- `inputs/compiled/` (layout antigo de context packs)
 	- `**/__pycache__/` (caches do Python)
 
 - Mantenha versionado (essencial):
@@ -195,6 +188,6 @@ Limpeza e Artefatos Gerados
 
 Observações finais
 ------------------
-
-- Os artefatos de cada batch são gravados em `outputs/<batch_id>/` (batch.json, input.jsonl, output.jsonl, errors.jsonl e pasta docs/ quando há parse).
-- A camada de serviços não executa parsing e nem lida com argparse; cada camada tem uma responsabilidade clara.
+- Artefatos: `batch.json`, `output.jsonl`, `errors.jsonl`, `docs/` por processo.
+- Tópicos suportados: `resumo`, `fluxo_execucao`, `regras_negocio`, `diagram_activity`, `diagram_sequence`.
+- Tópicos antigos (`riscos`, `arch-context`) e formatos legacy foram removidos na refatoração.
